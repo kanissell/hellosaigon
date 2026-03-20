@@ -8,6 +8,7 @@ export function useSpeechRecognition() {
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState("");
   const [isSupported, setIsSupported] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
 
   useEffect(() => {
@@ -18,7 +19,19 @@ export function useSpeechRecognition() {
     setIsSupported(!!SpeechRec);
   }, []);
 
-  const start = useCallback(() => {
+  const start = useCallback(async () => {
+    setError(null);
+
+    // Check mic permission first
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Release the stream immediately — we just needed permission
+      stream.getTracks().forEach((t) => t.stop());
+    } catch {
+      setError("mic-denied");
+      return;
+    }
+
     const SpeechRec =
       window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRec) return;
@@ -34,8 +47,15 @@ export function useSpeechRecognition() {
       setIsListening(false);
     };
 
-    recognition.onerror = () => {
+    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
       setIsListening(false);
+      if (event.error === "not-allowed") {
+        setError("mic-denied");
+      } else if (event.error === "no-speech") {
+        setError("no-speech");
+      } else {
+        setError(event.error);
+      }
     };
 
     recognition.onend = () => {
@@ -53,5 +73,7 @@ export function useSpeechRecognition() {
     setIsListening(false);
   }, []);
 
-  return { isListening, transcript, isSupported, start, stop };
+  const clearError = useCallback(() => setError(null), []);
+
+  return { isListening, transcript, isSupported, error, start, stop, clearError };
 }
