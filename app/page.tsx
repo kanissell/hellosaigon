@@ -4,6 +4,18 @@ import { FormEvent, useState, useRef, useEffect, useCallback } from "react";
 import type { ChatMessage } from "@/lib/types/chat";
 import { extractRecommendations } from "@/lib/memory/extractRecommendations";
 import type { RecommendationRecord } from "@/lib/memory/types";
+import type { UserProfile, LearnedTrait } from "@/lib/types/userProfile";
+import { LS_PROFILE_KEY } from "@/lib/types/userProfile";
+import type { Place } from "@/lib/data/places";
+import OnboardingModal from "@/components/OnboardingModal";
+import PlaceCard from "@/components/PlaceCard";
+import MessageContent from "@/components/MessageContent";
+import HUDHeader from "@/components/HUDHeader";
+import ScanningLoader from "@/components/ScanningLoader";
+import { generateSmartCards } from "@/lib/cards/generateSmartCards";
+import { parsePlaceReferences } from "@/lib/message/parsePlaceReferences";
+import VoiceButton from "@/components/VoiceButton";
+import LearnedTraitsPanel from "@/components/LearnedTraitsPanel";
 
 const LS_RECS_KEY = "hs_recs";
 const LS_CHAT_KEY = "hs_chat";
@@ -78,18 +90,103 @@ function getSmartSuggestions(): Suggestion[] {
   }
 }
 
+function getGreeting(profile: UserProfile | null): { heading: string; sub: string } {
+  const hour = new Date().getHours();
+  const timeGreet = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
+
+  if (!profile) {
+    return {
+      heading: `${timeGreet}. I'm your local Saigon concierge.`,
+      sub: "Here's what I'd suggest right now:",
+    };
+  }
+
+  const traits = profile.learnedTraits || [];
+  const locationTrait = traits.find((t) => t.category === "location");
+  const prefTrait = traits.find((t) => t.category === "preferences" || t.category === "dietary");
+
+  if (locationTrait || prefTrait) {
+    const parts: string[] = [`${timeGreet}.`];
+    if (prefTrait) parts.push(`Since you ${prefTrait.value.toLowerCase()},`);
+    parts.push("here's what looks good right now:");
+    return {
+      heading: `Welcome back.`,
+      sub: parts.join(" "),
+    };
+  }
+
+  return {
+    heading: `${timeGreet}. Welcome back.`,
+    sub: "Here's what I'd suggest right now:",
+  };
+}
+
 export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [hydrated, setHydrated] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [allPlaces, setAllPlaces] = useState<Place[]>([]);
+  const [smartCards, setSmartCards] = useState<Place[]>([]);
+  const [placeRefs, setPlaceRefs] = useState<Map<number, Place[]>>(new Map());
+  const [latestAssistantIdx, setLatestAssistantIdx] = useState(-1);
+  const [showTraits, setShowTraits] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const recsRef = useRef<RecommendationRecord[]>([]);
 
   useEffect(() => {
     recsRef.current = loadRecs();
     setMessages(loadChat());
+    try {
+      const raw = localStorage.getItem(LS_PROFILE_KEY);
+      if (raw) {
+        setProfile(JSON.parse(raw));
+      } else {
+        setShowOnboarding(true);
+      }
+    } catch {
+      setShowOnboarding(true);
+    }
     setHydrated(true);
+
+    fetch("/api/places")
+      .then((r) => r.json())
+      .then((places: Place[]) => {
+        setAllPlaces(places);
+        const savedMsgs = loadChat();
+        const refs = new Map<number, Place[]>();
+        savedMsgs.forEach((msg, i) => {
+          if (msg.role === "assistant") {
+            const matched = parsePlaceReferences(msg.content, places);
+            if (matched.length > 0) refs.set(i, matched);
+          }
+        });
+        if (refs.size > 0) setPlaceRefs(refs);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (allPlaces.length > 0) {
+      setSmartCards(generateSmartCards(allPlaces, profile, recsRef.current));
+    }
+  }, [allPlaces, profile]);
+
+  const handlePlaceEngage = useCallback((placeId: string) => {
+    const recs = recsRef.current;
+    let updated = false;
+    for (let i = recs.length - 1; i >= 0; i--) {
+      if (recs[i].placeId === placeId && !recs[i].engaged) {
+        recs[i].engaged = true;
+        updated = true;
+        break;
+      }
+    }
+    if (updated) {
+      recsRef.current = saveRecs(recs);
+    }
   }, []);
 
   const scrollToBottom = useCallback(() => {
@@ -105,42 +202,36 @@ export default function Home() {
     const trimmed = input.trim();
     if (!trimmed || isLoading) return;
 
-    const userMessage: ChatMessage = {
-      role: "user",
-      content: trimmed,
-    };
-
-    // Clear input immediately
+    const userMessage: ChatMessage = { role: "user", content: trimmed };
     setInput("");
 
-    // Add user message
     const newMessages = [...messages, userMessage];
     setMessages(newMessages);
     saveChat(newMessages);
     setIsLoading(true);
 
     try {
-      // Send POST request with message and conversation history
       const response = await fetch("/api/chat", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: trimmed,
           history: messages,
           recommendationHistory: recsRef.current,
+          userProfile: profile,
         }),
       });
 
-      const data: { text: string } = await response.json();
+      const data: { text: string; updatedTraits?: LearnedTrait[] } = await response.json();
+      const assistantMessage: ChatMessage = { role: "assistant", content: data.text };
 
-      const assistantMessage: ChatMessage = {
-        role: "assistant",
-        content: data.text,
-      };
+      // Persist learned traits
+      if (data.updatedTraits && profile) {
+        const updatedProfile = { ...profile, learnedTraits: data.updatedTraits };
+        setProfile(updatedProfile);
+        localStorage.setItem(LS_PROFILE_KEY, JSON.stringify(updatedProfile));
+      }
 
-      // Extract and save recommendations from response
       const newRecs = extractRecommendations(data.text);
       if (newRecs.length > 0) {
         recsRef.current = saveRecs([...recsRef.current, ...newRecs]);
@@ -149,6 +240,14 @@ export default function Home() {
       const withAssistant = [...newMessages, assistantMessage];
       setMessages(withAssistant);
       saveChat(withAssistant);
+      setLatestAssistantIdx(withAssistant.length - 1);
+
+      if (allPlaces.length > 0) {
+        const refs = parsePlaceReferences(data.text, allPlaces);
+        if (refs.length > 0) {
+          setPlaceRefs((prev) => new Map(prev).set(withAssistant.length - 1, refs));
+        }
+      }
     } catch {
       const errorMessage: ChatMessage = {
         role: "assistant",
@@ -163,40 +262,68 @@ export default function Home() {
   };
 
   const suggestions = getSmartSuggestions();
+  const greeting = getGreeting(profile);
 
   return (
-    <div className="flex min-h-screen flex-col bg-zinc-50 dark:bg-black">
-      {/* Header */}
-      <header className="border-b border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950">
-        <div className="mx-auto max-w-2xl">
-          <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
-            HelloSaigon
-          </h1>
-          <p className="text-sm text-zinc-500 dark:text-zinc-400">
-            Your local Saigon concierge
-          </p>
-        </div>
-      </header>
+    <div className="relative flex min-h-screen flex-col" style={{ zIndex: 1 }}>
+      {showOnboarding && (
+        <OnboardingModal
+          onComplete={(p) => {
+            setProfile(p);
+            setShowOnboarding(false);
+          }}
+        />
+      )}
+
+      {/* Learned Traits Panel */}
+      {showTraits && profile && (
+        <LearnedTraitsPanel
+          profile={profile}
+          onUpdate={setProfile}
+          onClose={() => setShowTraits(false)}
+        />
+      )}
+
+      {/* JARVIS HUD Header */}
+      <HUDHeader onSettingsClick={() => setShowTraits(true)} />
 
       {/* Messages */}
       <main className="flex-1 overflow-y-auto px-4 py-6">
         <div className="mx-auto max-w-2xl space-y-4">
           {hydrated && messages.length === 0 && (
-            <div className="py-12 text-center">
-              <p className="mb-2 text-lg text-zinc-700 dark:text-zinc-300">
-                Hey! I&apos;m your local Saigon concierge.
+            <div className="py-8">
+              <p className="mb-1 text-lg font-medium text-foreground">
+                {greeting.heading}
               </p>
-              <p className="mb-6 text-sm text-zinc-500 dark:text-zinc-400">
-                Ask me anything — where to eat, best coffee for working, a
-                trusted barber, motorbike repair, whatever you need.
+              <p className="mb-6 text-sm text-cyan-600 dark:text-cyan-500/50">
+                {greeting.sub}
               </p>
-              <div className="flex flex-wrap justify-center gap-2">
+
+              {smartCards.length > 0 && (
+                <div className="mb-6 grid gap-3">
+                  {smartCards.map((place, i) => (
+                    <PlaceCard
+                      key={place.id}
+                      place={place}
+                      animationDelay={i * 0.12}
+                      onClick={() =>
+                        setInput(`Tell me more about ${place.name}`)
+                      }
+                    />
+                  ))}
+                </div>
+              )}
+
+              <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.2em] text-cyan-600/40 dark:text-cyan-500/30">
+                Or ask me about
+              </p>
+              <div className="flex flex-wrap gap-2">
                 {suggestions.map((suggestion) => (
                   <button
                     key={suggestion.label}
                     type="button"
                     onClick={() => setInput(suggestion.query)}
-                    className="rounded-full border border-zinc-300 bg-white px-4 py-2 text-sm text-zinc-700 transition-colors hover:border-zinc-400 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:border-zinc-600 dark:hover:bg-zinc-800"
+                    className="chip rounded-full px-4 py-2 text-sm text-foreground/70 hover:text-cyan-400"
                   >
                     {suggestion.label}
                   </button>
@@ -208,32 +335,37 @@ export default function Home() {
           {messages.map((message, index) => (
             <div
               key={index}
-              className={`flex ${
+              className={`msg-appear flex ${
                 message.role === "user" ? "justify-end" : "justify-start"
               }`}
             >
               <div
                 className={`max-w-[85%] rounded-2xl px-4 py-2.5 ${
                   message.role === "user"
-                    ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
-                    : "bg-white text-zinc-900 shadow-sm ring-1 ring-zinc-200 dark:bg-zinc-900 dark:text-zinc-50 dark:ring-zinc-800"
+                    ? "bg-gradient-to-br from-cyan-500 to-teal-600 text-white"
+                    : "glass-card text-foreground"
                 }`}
               >
-                <p className="whitespace-pre-wrap text-[15px] leading-relaxed">
-                  {message.content}
-                </p>
+                {message.role === "assistant" ? (
+                  <MessageContent
+                    text={message.content}
+                    referencedPlaces={placeRefs.get(index) || []}
+                    onPlaceEngage={handlePlaceEngage}
+                    animate={index === latestAssistantIdx}
+                  />
+                ) : (
+                  <p className="whitespace-pre-wrap text-[15px] leading-relaxed">
+                    {message.content}
+                  </p>
+                )}
               </div>
             </div>
           ))}
 
           {isLoading && (
-            <div className="flex justify-start">
-              <div className="rounded-2xl bg-white px-4 py-3 shadow-sm ring-1 ring-zinc-200 dark:bg-zinc-900 dark:ring-zinc-800">
-                <div className="flex space-x-1.5">
-                  <div className="h-2 w-2 animate-bounce rounded-full bg-zinc-400 [animation-delay:-0.3s]"></div>
-                  <div className="h-2 w-2 animate-bounce rounded-full bg-zinc-400 [animation-delay:-0.15s]"></div>
-                  <div className="h-2 w-2 animate-bounce rounded-full bg-zinc-400"></div>
-                </div>
+            <div className="msg-appear flex justify-start">
+              <div className="max-w-[85%]">
+                <ScanningLoader />
               </div>
             </div>
           )}
@@ -243,10 +375,10 @@ export default function Home() {
       </main>
 
       {/* Input */}
-      <footer className="border-t border-zinc-200 bg-white px-4 py-4 dark:border-zinc-800 dark:bg-zinc-950">
+      <footer className="hud-border-top px-4 py-4" style={{ zIndex: 10 }}>
         <form
           onSubmit={handleSubmit}
-          className="mx-auto flex max-w-2xl gap-3"
+          className="glow-border mx-auto flex max-w-2xl gap-2 rounded-xl bg-background/50 p-1.5 backdrop-blur-sm"
         >
           <input
             type="text"
@@ -254,12 +386,15 @@ export default function Home() {
             onChange={(event) => setInput(event.target.value)}
             placeholder="Ask me anything about Saigon..."
             disabled={isLoading}
-            className="flex-1 rounded-xl border border-zinc-300 bg-zinc-50 px-4 py-3 text-[15px] text-zinc-900 outline-none transition-colors placeholder:text-zinc-400 focus:border-zinc-400 focus:bg-white disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50 dark:placeholder:text-zinc-500 dark:focus:border-zinc-600 dark:focus:bg-zinc-800"
+            className="flex-1 bg-transparent px-3 py-2.5 text-[15px] text-foreground outline-none placeholder:text-cyan-700/30 dark:placeholder:text-cyan-500/25 disabled:opacity-50"
           />
+          <VoiceButton onTranscript={setInput} disabled={isLoading} />
           <button
             type="submit"
             disabled={!input.trim() || isLoading}
-            className="rounded-xl bg-zinc-900 px-5 py-3 text-[15px] font-medium text-white transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200"
+            className={`btn-accent rounded-lg px-5 py-2.5 text-[15px] ${
+              input.trim() && !isLoading ? "btn-accent-pulse" : ""
+            }`}
           >
             Send
           </button>

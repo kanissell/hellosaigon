@@ -1,4 +1,6 @@
 import type { Place } from "@/lib/data/places";
+import type { UserProfile } from "@/lib/types/userProfile";
+import type { HistoryAnalysis } from "@/lib/memory/analyzeHistory";
 
 export type SearchContext = {
   category?: string;
@@ -116,7 +118,69 @@ function calculateScore(place: Place, context: SearchContext, dist?: number): nu
   return score;
 }
 
-export function searchPlaces(context: SearchContext, places: Place[]): ScoredPlace[] {
+function applyProfileScoring(score: number, place: Place, profile?: UserProfile): number {
+  if (!profile) return score;
+
+  // Budget match
+  if (profile.budget !== "any" && place.priceRange === profile.budget) {
+    score += 1;
+  }
+
+  // Neighborhood preference
+  if (profile.neighborhoods.length > 0) {
+    const inPreferred = profile.neighborhoods.some(
+      (n) => place.district.toLowerCase() === n.toLowerCase()
+    );
+    if (inPreferred) score += 1.5;
+  }
+
+  // Wifi need → boost work vibes
+  if (profile.needsWifi && place.vibes.includes("work")) {
+    score += 1;
+  }
+
+  // Dog-friendly requirement
+  if (profile.dogFriendly && place.dogFriendly) {
+    score += 1;
+  }
+
+  // Tired-of cuisines → penalize
+  if (profile.tiredOfCuisines.length > 0) {
+    const placeTags = `${place.subcategory} ${place.signatureItem}`.toLowerCase();
+    for (const cuisine of profile.tiredOfCuisines) {
+      if (placeTags.includes(cuisine)) {
+        score -= 2;
+        break;
+      }
+    }
+  }
+
+  return score;
+}
+
+function applyHistoryScoring(score: number, place: Place, history?: HistoryAnalysis): number {
+  if (!history) return score;
+
+  // Recommended in last 24h → heavy penalty
+  if (history.recentPlaceIds.has(place.id)) {
+    score -= 5;
+  }
+
+  // Same subcategory as yesterday → mild penalty
+  if (history.yesterdaySubcategories.has(place.subcategory)) {
+    score -= 2;
+  }
+
+  // Favorite not seen in 14+ days → boost
+  const daysSince = history.favorites.get(place.id);
+  if (daysSince !== undefined && daysSince >= 14) {
+    score += 3;
+  }
+
+  return score;
+}
+
+export function searchPlaces(context: SearchContext, places: Place[], profile?: UserProfile, history?: HistoryAnalysis): ScoredPlace[] {
   let results = places.filter((place) => place.verifiedByYou);
 
   // Filter by category
@@ -169,8 +233,8 @@ export function searchPlaces(context: SearchContext, places: Place[]): ScoredPla
     }
   }
 
-  // Filter by dog-friendly
-  if (context.dogFriendly) {
+  // Filter by dog-friendly (from query or profile)
+  if (context.dogFriendly || profile?.dogFriendly) {
     results = results.filter((place) => place.dogFriendly);
   }
 
@@ -181,7 +245,7 @@ export function searchPlaces(context: SearchContext, places: Place[]): ScoredPla
 
   const scored = results.map((place) => {
     const dist = distCenter ? distanceKm(distCenter, place.coordinates) : undefined;
-    const score = calculateScore(place, context, dist);
+    const score = applyHistoryScoring(applyProfileScoring(calculateScore(place, context, dist), place, profile), place, history);
     const enriched: ScoredPlace = {
       ...place,
       _distanceKm: dist !== undefined ? Math.round(dist * 10) / 10 : undefined,
