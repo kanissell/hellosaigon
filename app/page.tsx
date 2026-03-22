@@ -285,7 +285,9 @@ export default function Home() {
       )}
 
       {/* JARVIS HUD Header */}
-      <HUDHeader onSettingsClick={() => setShowTraits(true)} />
+      <div className="safe-top">
+        <HUDHeader onSettingsClick={() => setShowTraits(true)} />
+      </div>
 
       {/* Messages */}
       <main className="flex-1 overflow-y-auto px-4 py-6">
@@ -375,7 +377,7 @@ export default function Home() {
       </main>
 
       {/* Input */}
-      <footer className="hud-border-top px-4 py-4" style={{ zIndex: 10 }}>
+      <footer className="hud-border-top safe-bottom px-4 py-4" style={{ zIndex: 10 }}>
         <form
           onSubmit={handleSubmit}
           className="glow-border mx-auto flex max-w-2xl gap-2 rounded-xl bg-background/50 p-1.5 backdrop-blur-sm"
